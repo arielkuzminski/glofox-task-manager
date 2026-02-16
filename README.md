@@ -6,6 +6,7 @@ Skrypt Tampermonkey dla `https://app.glofox.com/dashboard/#/tasks`, ktory:
 - pobiera wszystkie zadania jednym API call (`limit=10000`),
 - wyswietla klasyczna tabele z paginacja,
 - udostepnia filtry i sortowanie,
+- pozwala edytowac task po kliknieciu wiersza (nazwa, termin, uwagi, oznaczenie jako wykonane),
 - zapamietuje ustawienia UI (filtry/sort/page size) w `localStorage`.
 
 ## Wymagania
@@ -29,9 +30,9 @@ Skrypt Tampermonkey dla `https://app.glofox.com/dashboard/#/tasks`, ktory:
 3. Modal pobierze dane i pozwoli filtrowac/sortowac/paginowac.
 4. Uzyj `Odswiez dane`, aby pobrac swiezy snapshot.
 
-## Zakres v1
+## Zakres v1.1
 
-- Read-only explorer (bez mutacji taskow i bez akcji per-row).
+- Explorer + edycja pojedynczego taska z poziomu modala.
 - Filtry:
   - nazwa zadania,
   - klient,
@@ -50,9 +51,17 @@ Skrypt Tampermonkey dla `https://app.glofox.com/dashboard/#/tasks`, ktory:
 - Paginacja:
   - domyslnie `100`/strone,
   - opcje `25/50/100/200`.
+- Edycja:
+  - klik wiersza otwiera modal edycji,
+  - pola edytowalne: `Nazwa zadania`, `Termin wykonalnosci`, `Uwagi`, `Ustaw jako wykonane`,
+  - `Klient`, `Typ zadania`, `Przypisano do` sa read-only.
 
 ## Uwagi
 
 - Jesli pojawi sie blad autoryzacji, odswiez sesje Glofox i otworz ponownie widok tasks.
 - Skrypt jest odporny na nawigacje SPA (hashchange/mutation/url watcher).
 - Skrypt zawiera wewnetrzne mechanizmy diagnostyczne i `SAFE_MODE` jako fallback anty-whiteout.
+- Zapis zmian uzywa endpointu:
+  - `PATCH /task-management-api/v1/locations/{locationId}/tasks/{taskId}`
+  - payload podstawowy: `name`, `type`, `notes`, `due_date`, `customer_id`, `customer_first_name`, `customer_last_name`, `staff_id`
+  - pola `completion_date` i `completed_by` dolaczane tylko gdy ustawiasz `Ustaw jako wykonane`.

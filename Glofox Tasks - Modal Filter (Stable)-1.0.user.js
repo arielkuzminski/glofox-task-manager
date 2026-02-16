@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Glofox Tasks - Modal Filter (Stable)
 // @namespace    glofox
-// @version      1.0
-// @description  Modal z pelna lista zadan, paginacja, filtry i sortowanie.
+// @version      1.1
+// @description  Modal z pelna lista zadan, paginacja, filtry, sortowanie i edycja taska.
 // @match        https://app.glofox.com/*
 // @run-at       document-idle
 // @grant        none
@@ -23,8 +23,10 @@
   const API_TIMEOUT_MS = 15000;
   const DEBUG = false;
   const DEBUG_PANEL = false;
+  const CONTRACT_STORAGE_KEY = "glofoxTaskFilter:v1:updateContract";
+  const STATIC_UPDATE_CONTRACT = true;
 
-  const AUTH = { token: "", locationId: "", patched: false };
+  const AUTH = { token: "", locationId: "", userId: "", patched: false };
   const STATE = {
     open: false,
     loading: false,
@@ -36,6 +38,39 @@
     page: 1,
     pages: 1,
     ui: defaults(),
+    edit: {
+      open: false,
+      taskId: "",
+      saving: false,
+      error: "",
+      success: "",
+      draft: {
+        name: "",
+        dueDateInput: "",
+        notes: "",
+        markDone: false,
+      },
+      dirty: false,
+      blockedByApiTaskIds: {},
+    },
+    contract: {
+      status: "unknown",
+      ready: false,
+      method: "",
+      url: "",
+      sampleTaskId: "",
+      bodyTemplate: null,
+      fieldPaths: {
+        name: "",
+        dueDate: "",
+        notes: "",
+        done: "",
+      },
+      doneValueType: "",
+      lastError: "",
+      capturedAt: null,
+      ownRequestInFlight: false,
+    },
     safeMode: false,
     payloadMeta: {
       rootKeys: [],
@@ -163,6 +198,225 @@
     }
     return Number.NaN;
   }
+  function toDateInputValue(value) {
+    const ms = toMillis(value);
+    if (!Number.isFinite(ms)) return "";
+    const d = new Date(ms);
+    if (Number.isNaN(d.getTime())) return "";
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  }
+  function deepClone(value) {
+    if (value === null || value === undefined) return value;
+    try {
+      return JSON.parse(JSON.stringify(value));
+    } catch (_e) {
+      return value;
+    }
+  }
+  function normalizePath(path) {
+    return String(path || "")
+      .replace(/\[(\d+)\]/g, ".$1")
+      .replace(/^\./, "")
+      .trim();
+  }
+  function splitPath(path) {
+    return normalizePath(path).split(".").filter(Boolean);
+  }
+  function getByPath(obj, path) {
+    const parts = splitPath(path);
+    if (!parts.length) return undefined;
+    let cur = obj;
+    for (const p of parts) {
+      if (cur === null || cur === undefined) return undefined;
+      cur = cur[p];
+    }
+    return cur;
+  }
+  function setByPath(obj, path, value) {
+    const parts = splitPath(path);
+    if (!parts.length) return false;
+    let cur = obj;
+    for (let i = 0; i < parts.length - 1; i += 1) {
+      const key = parts[i];
+      if (cur[key] === null || cur[key] === undefined) return false;
+      cur = cur[key];
+    }
+    cur[parts[parts.length - 1]] = value;
+    return true;
+  }
+  function listAllPaths(obj, basePath) {
+    const out = [];
+    function walk(value, path) {
+      if (value === null || value === undefined) return;
+      if (Array.isArray(value)) {
+        value.forEach((item, idx) => walk(item, path ? `${path}.${idx}` : String(idx)));
+        return;
+      }
+      if (typeof value !== "object") {
+        out.push(path);
+        return;
+      }
+      Object.keys(value).forEach((k) => walk(value[k], path ? `${path}.${k}` : k));
+    }
+    walk(obj, basePath || "");
+    return out.filter(Boolean);
+  }
+  function pathIncludesKey(path, keywords) {
+    const p = lower(path);
+    return keywords.some((kw) => p.includes(kw));
+  }
+  function findFirstPath(obj, keywords) {
+    const paths = listAllPaths(obj);
+    for (const p of paths) {
+      if (pathIncludesKey(p, keywords)) return p;
+    }
+    return "";
+  }
+  function extractTaskIdFromUrl(url) {
+    const s = String(url || "");
+    const m = s.match(/\/tasks\/([a-f0-9]{24})(?:[/?#]|$)/i);
+    return m && m[1] ? m[1] : "";
+  }
+  function findIdCandidatesInBody(body) {
+    const out = [];
+    const paths = listAllPaths(body);
+    for (const p of paths) {
+      if (!pathIncludesKey(p, ["id", "_id", "task"])) continue;
+      const v = getByPath(body, p);
+      if (typeof v !== "string") continue;
+      if (/^[a-f0-9]{24}$/i.test(v)) out.push({ path: p, value: v });
+    }
+    return out;
+  }
+  function replaceIdRecursive(value, oldId, newId) {
+    if (value === null || value === undefined) return value;
+    if (typeof value === "string") return value === oldId ? newId : value;
+    if (Array.isArray(value)) return value.map((x) => replaceIdRecursive(x, oldId, newId));
+    if (typeof value === "object") {
+      const out = {};
+      Object.keys(value).forEach((k) => {
+        out[k] = replaceIdRecursive(value[k], oldId, newId);
+      });
+      return out;
+    }
+    return value;
+  }
+  function guessFieldPaths(body) {
+    return {
+      name: findFirstPath(body, ["name", "title"]),
+      dueDate: findFirstPath(body, ["due_date", "dueDate", "due", "execution_date", "executionDate", "date"]),
+      notes: findFirstPath(body, ["notes", "note", "description", "comment", "remarks", "uwag"]),
+      done: findFirstPath(body, ["done", "completed", "is_done", "isDone", "completion", "status"]),
+    };
+  }
+  function parseJsonBody(body) {
+    if (!body) return null;
+    if (typeof body === "string") return safeJson(body);
+    if (body instanceof FormData) {
+      const out = {};
+      for (const [k, v] of body.entries()) out[k] = v;
+      return out;
+    }
+    if (body instanceof URLSearchParams) {
+      const out = {};
+      for (const [k, v] of body.entries()) out[k] = v;
+      return out;
+    }
+    if (typeof body === "object") return deepClone(body);
+    return null;
+  }
+  function persistContract() {
+    try {
+      const snapshot = {
+        status: STATE.contract.status,
+        ready: STATE.contract.ready,
+        method: STATE.contract.method,
+        url: STATE.contract.url,
+        sampleTaskId: STATE.contract.sampleTaskId,
+        bodyTemplate: STATE.contract.bodyTemplate,
+        fieldPaths: STATE.contract.fieldPaths,
+        doneValueType: STATE.contract.doneValueType,
+        capturedAt: STATE.contract.capturedAt,
+      };
+      sessionStorage.setItem(CONTRACT_STORAGE_KEY, JSON.stringify(snapshot));
+    } catch (_e) {
+      // noop
+    }
+  }
+  function loadContract() {
+    try {
+      const raw = sessionStorage.getItem(CONTRACT_STORAGE_KEY);
+      if (!raw) return;
+      const parsed = safeJson(raw);
+      if (!parsed || typeof parsed !== "object") return;
+      STATE.contract = {
+        ...STATE.contract,
+        ...parsed,
+        fieldPaths: {
+          ...STATE.contract.fieldPaths,
+          ...(parsed.fieldPaths || {}),
+        },
+      };
+    } catch (_e) {
+      // noop
+    }
+    if (STATIC_UPDATE_CONTRACT && AUTH.locationId) {
+      STATE.contract.status = "ready";
+      STATE.contract.ready = true;
+      STATE.contract.method = "PATCH";
+      STATE.contract.url = `https://app.glofox.com/task-management-api/v1/locations/${AUTH.locationId}/tasks/__TASK_ID__`;
+      STATE.contract.sampleTaskId = "__TASK_ID__";
+      STATE.contract.bodyTemplate = null;
+      STATE.contract.fieldPaths = {
+        name: "name",
+        dueDate: "due_date",
+        notes: "notes",
+        done: "completion_date",
+      };
+      STATE.contract.doneValueType = "number";
+      STATE.contract.lastError = "";
+      STATE.contract.capturedAt = new Date().toISOString();
+    }
+  }
+  function registerDiscoveredContract({ method, url, body, taskId }) {
+    if (!method || !url || !body) return;
+    const guessed = guessFieldPaths(body);
+    const doneValue = guessed.done ? getByPath(body, guessed.done) : undefined;
+    STATE.contract.status = "ready";
+    STATE.contract.ready = true;
+    STATE.contract.method = String(method || "PATCH").toUpperCase();
+    STATE.contract.url = String(url || "");
+    STATE.contract.sampleTaskId = String(taskId || "");
+    STATE.contract.bodyTemplate = deepClone(body);
+    STATE.contract.fieldPaths = guessed;
+    STATE.contract.doneValueType = typeof doneValue;
+    STATE.contract.lastError = "";
+    STATE.contract.capturedAt = new Date().toISOString();
+    persistContract();
+    debugLog("contract-ready", {
+      method: STATE.contract.method,
+      url: STATE.contract.url,
+      sampleTaskId: STATE.contract.sampleTaskId,
+      fields: STATE.contract.fieldPaths,
+    });
+  }
+  function shouldCaptureAsTaskUpdate({ method, url, body }) {
+    const m = String(method || "").toUpperCase();
+    if (!["PATCH", "PUT", "POST"].includes(m)) return false;
+    const u = String(url || "");
+    if (!u.includes("task-management-api")) return false;
+    if (!u.includes("/tasks")) return false;
+    if (!body || typeof body !== "object") return false;
+    const hasLikelyEditableField =
+      Boolean(findFirstPath(body, ["name", "title"])) ||
+      Boolean(findFirstPath(body, ["notes", "description", "comment", "uwag"])) ||
+      Boolean(findFirstPath(body, ["due_date", "dueDate", "due", "execution", "date"])) ||
+      Boolean(findFirstPath(body, ["status", "done", "completed", "completion"]));
+    return hasLikelyEditableField;
+  }
 
   function pickJwt(raw) {
     const s = String(raw || "");
@@ -188,7 +442,9 @@
     AUTH.token = token;
     const payload = jwtPayload(token);
     const branchId = payload && payload.user ? payload.user.branch_id : "";
+    const userId = payload && payload.user ? payload.user._id : "";
     if (branchId) AUTH.locationId = String(branchId);
+    if (userId) AUTH.userId = String(userId);
   }
   function captureHeaders(headersLike) {
     if (!headersLike) return;
@@ -234,30 +490,189 @@
     if (AUTH.patched) return;
     AUTH.patched = true;
     const nativeFetch = window.fetch;
-    window.fetch = function patchedFetch(input, init) {
+    window.fetch = async function patchedFetch(input, init) {
+      let requestUrl = "";
+      let requestMethod = "GET";
+      let requestBodyParsed = null;
       try {
         if (init && init.headers) captureHeaders(init.headers);
         if (input && typeof input === "object" && input.headers) captureHeaders(input.headers);
+        requestMethod = String(
+          (init && init.method) ||
+            (input && typeof input === "object" && input.method) ||
+            "GET",
+        ).toUpperCase();
+        requestUrl = String(
+          typeof input === "string"
+            ? input
+            : input && typeof input === "object" && input.url
+              ? input.url
+              : "",
+        );
+        const requestBodyRaw =
+          (init && Object.prototype.hasOwnProperty.call(init, "body") ? init.body : undefined) ||
+          (input && typeof input === "object" && Object.prototype.hasOwnProperty.call(input, "body")
+            ? input.body
+            : undefined);
+        requestBodyParsed = parseJsonBody(requestBodyRaw);
       } catch (_e) {
         // noop
       }
-      return nativeFetch.apply(this, arguments);
+      const response = await nativeFetch.apply(this, arguments);
+      try {
+        if (
+          !STATE.contract.ownRequestInFlight &&
+          response &&
+          response.ok &&
+          shouldCaptureAsTaskUpdate({
+            method: requestMethod,
+            url: requestUrl,
+            body: requestBodyParsed,
+          })
+        ) {
+          const fromUrl = extractTaskIdFromUrl(requestUrl);
+          const candidates = findIdCandidatesInBody(requestBodyParsed || {});
+          const fromBody = candidates.length ? candidates[0].value : "";
+          registerDiscoveredContract({
+            method: requestMethod,
+            url: requestUrl,
+            body: requestBodyParsed,
+            taskId: fromUrl || fromBody,
+          });
+        }
+      } catch (_e) {
+        // noop
+      }
+      return response;
+    };
+    const nativeXhrOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function patchedXhrOpen(method, url) {
+      this.__gfTaskFilterMeta = this.__gfTaskFilterMeta || {};
+      this.__gfTaskFilterMeta.method = String(method || "GET").toUpperCase();
+      this.__gfTaskFilterMeta.url = String(url || "");
+      return nativeXhrOpen.apply(this, arguments);
     };
     const nativeSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
     XMLHttpRequest.prototype.setRequestHeader = function patchedSetRequestHeader(name, value) {
       if (String(name || "").toLowerCase() === "authorization") captureAuth(value);
+      this.__gfTaskFilterMeta = this.__gfTaskFilterMeta || {};
+      const key = String(name || "").toLowerCase();
+      this.__gfTaskFilterMeta.headers = this.__gfTaskFilterMeta.headers || {};
+      this.__gfTaskFilterMeta.headers[key] = value;
       return nativeSetRequestHeader.apply(this, arguments);
+    };
+    const nativeXhrSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function patchedXhrSend(body) {
+      this.__gfTaskFilterMeta = this.__gfTaskFilterMeta || {};
+      this.__gfTaskFilterMeta.body = parseJsonBody(body);
+      this.addEventListener(
+        "loadend",
+        () => {
+          try {
+            const meta = this.__gfTaskFilterMeta || {};
+            if (STATE.contract.ownRequestInFlight) return;
+            if (this.status < 200 || this.status >= 300) return;
+            if (
+              shouldCaptureAsTaskUpdate({
+                method: meta.method,
+                url: meta.url,
+                body: meta.body,
+              })
+            ) {
+              const fromUrl = extractTaskIdFromUrl(meta.url);
+              const candidates = findIdCandidatesInBody(meta.body || {});
+              const fromBody = candidates.length ? candidates[0].value : "";
+              registerDiscoveredContract({
+                method: meta.method,
+                url: meta.url,
+                body: meta.body,
+                taskId: fromUrl || fromBody,
+              });
+            }
+          } catch (_e) {
+            // noop
+          }
+        },
+        { once: true },
+      );
+      return nativeXhrSend.apply(this, arguments);
     };
   }
   function getAuth() {
     if (!AUTH.token || !AUTH.locationId) scanStorage();
-    return { token: AUTH.token || "", locationId: AUTH.locationId || "" };
+    return { token: AUTH.token || "", locationId: AUTH.locationId || "", userId: AUTH.userId || "" };
   }
 
   function mapStatus(s) {
+    if (s === "DONE" || s === "COMPLETED" || s === "COMPLETE") return "DONE";
     if (s === "TODAY") return "TODAY";
     if (s === "OVERDUE") return "OVERDUE";
     return "PENDING";
+  }
+  function firstNonEmpty(values) {
+    for (const v of values) {
+      const t = text(v);
+      if (t) return t;
+    }
+    return "";
+  }
+  function extractNotesFromRaw(raw) {
+    if (!raw || typeof raw !== "object") return "";
+    return firstNonEmpty([
+      raw.notes,
+      raw.note,
+      raw.description,
+      raw.comment,
+      raw.remarks,
+      raw.details,
+      raw.message,
+      raw.body,
+      raw.meta && raw.meta.notes,
+      raw.metadata && raw.metadata.notes,
+    ]);
+  }
+  function deriveDoneFromRaw(raw) {
+    if (!raw || typeof raw !== "object") return false;
+    if (raw.completion_date || raw.completed_at || raw.closed_at) return true;
+    if (typeof raw.completed === "boolean") return raw.completed;
+    if (typeof raw.done === "boolean") return raw.done;
+    const status = upper(text(raw.status));
+    if (["DONE", "COMPLETED", "COMPLETE", "CLOSED"].includes(status)) return true;
+    return false;
+  }
+  function deriveId(rawValue) {
+    if (!rawValue) return "";
+    if (typeof rawValue === "string") return rawValue;
+    if (typeof rawValue === "object") {
+      return text(rawValue._id || rawValue.id || rawValue.original_user_id || "");
+    }
+    return "";
+  }
+  function deriveCustomerIdFromTask(task) {
+    if (!task) return "";
+    const raw = task.raw || {};
+    return (
+      text(raw.customer_id || raw.original_customer_id) ||
+      text(raw.customer && (raw.customer.original_user_id || raw.customer._id || raw.customer.id)) ||
+      text(task.customerId) ||
+      ""
+    );
+  }
+  function deriveStaffIdFromTask(task, authUserId) {
+    if (!task) return "";
+    const raw = task.raw || {};
+    return (
+      text(authUserId) ||
+      text(task.staffId) ||
+      text(raw.staff_id) ||
+      text(raw.original_staff_id) ||
+      deriveId(raw.staff) ||
+      deriveId(raw.created_by) ||
+      ""
+    );
+  }
+  function upper(v) {
+    return text(v).toUpperCase();
   }
   function personName(person) {
     if (!person) return "-";
@@ -267,16 +682,36 @@
     return full || "-";
   }
   function normalizeTask(raw) {
+    const customerObj = raw ? raw.customer : null;
+    const customerId =
+      text(raw && (raw.customer_id || raw.original_customer_id)) ||
+      text(customerObj && (customerObj.original_user_id || customerObj._id || customerObj.id)) ||
+      "";
+    const customerFirstName = text(raw && raw.customer_first_name) || text(customerObj && customerObj.first_name);
+    const customerLastName = text(raw && raw.customer_last_name) || text(customerObj && customerObj.last_name);
+    const staffObj = raw ? raw.staff : null;
+    const staffId =
+      text(raw && (raw.original_staff_id || raw.staff_id)) ||
+      deriveId(staffObj) ||
+      deriveId(raw && raw.created_by);
     return {
       id: text(raw && raw._id),
       name: text(raw && raw.name),
       type: text(raw && raw.type) || "Unknown",
+      statusRaw: text(raw && raw.status),
       statusUi: mapStatus(raw ? raw.status : ""),
       dueDate: raw ? raw.due_date || "" : "",
       completionDate: raw ? raw.completion_date || "" : "",
+      notes: extractNotesFromRaw(raw),
+      isDone: deriveDoneFromRaw(raw),
+      customerId: customerId,
+      customerFirstName: customerFirstName,
+      customerLastName: customerLastName,
+      staffId: staffId,
       customerName: personName(raw ? raw.customer : null),
       createdByName: personName(raw ? raw.created_by : null),
       staffName: personName(raw ? raw.staff : null),
+      raw: deepClone(raw || {}),
     };
   }
   function extractList(payload) {
@@ -477,6 +912,8 @@
 .gf-field input,.gf-field select{border:1px solid #d8dcf4;border-radius:7px;min-height:32px;padding:5px 8px;font-size:12px}
 .gf-wrap{flex:1;min-height:0;overflow:auto}.gf-table{width:100%;border-collapse:collapse;font-size:12px}
 .gf-table th,.gf-table td{border-bottom:1px solid #eef0f9;padding:9px 10px;text-align:left;vertical-align:top;white-space:nowrap}
+.gf-row-clickable{cursor:pointer}
+.gf-row-clickable:hover td{background:#f4f6ff}
 .gf-table th{position:sticky;top:0;background:#fbfbff;z-index:1;font-weight:700;color:#2b2f62}
 .gf-th{border:none;background:transparent;color:inherit;font-weight:inherit;cursor:pointer;padding:0}
 .gf-tag{display:inline-block;border-radius:999px;padding:3px 8px;font-size:11px;font-weight:700}
@@ -487,8 +924,26 @@
 .gf-debug{margin:8px 14px;padding:8px 10px;border:1px dashed #9ea3d3;border-radius:8px;background:#f7f8ff;color:#2d3164;font-size:11px;line-height:1.3}
 .gf-safe-list{margin:0;padding:8px 18px 16px 30px;font-size:13px;line-height:1.45}
 .gf-safe-list li{margin:2px 0;color:#1f2340}
+.gf-edit-overlay{position:fixed;inset:0;background:rgba(10,14,28,.42);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100001}
+.gf-edit-modal{width:min(760px,96vw);max-height:90vh;overflow:auto;background:#fff;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+.gf-edit-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;padding:14px 16px;border-bottom:1px solid #ececf6}
+.gf-edit-title{font-size:16px;font-weight:700;color:#202442}
+.gf-edit-sub{font-size:12px;color:#6a7096;margin-top:2px}
+.gf-edit-body{padding:14px 16px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.gf-edit-full{grid-column:1 / -1}
+.gf-edit-field{display:flex;flex-direction:column;gap:4px}
+.gf-edit-field label{font-size:12px;font-weight:600;color:#50567e}
+.gf-edit-field input,.gf-edit-field textarea{border:1px solid #d8dcf4;border-radius:8px;padding:8px 10px;font-size:13px}
+.gf-edit-field textarea{min-height:96px;resize:vertical}
+.gf-edit-ro{border:1px solid #ececf6;background:#f8f9ff;border-radius:8px;padding:8px 10px;font-size:12px;color:#4b5076;min-height:36px;display:flex;align-items:center}
+.gf-edit-foot{padding:12px 16px;border-top:1px solid #ececf6;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.gf-edit-status{font-size:12px;color:#5a6088}
+.gf-edit-status.err{color:#b4233f}
+.gf-edit-status.ok{color:#1e7d3f}
+.gf-check{display:flex;align-items:center;gap:8px;font-size:13px;color:#2b2f62}
 @media (max-width:1100px){.gf-grid{grid-template-columns:repeat(2,minmax(160px,1fr))}}
 @media (max-width:700px){.gf-grid{grid-template-columns:1fr}}
+@media (max-width:760px){.gf-edit-body{grid-template-columns:1fr}}
 `;
   }
   function ensureShadowStyle(shadowRoot) {
@@ -571,8 +1026,344 @@
     saveUi();
     render();
   }
+  function findTaskById(taskId) {
+    return STATE.all.find((task) => task.id === taskId) || null;
+  }
+  function contractStatusText() {
+    if (STATIC_UPDATE_CONTRACT) return "Gotowy (statyczny)";
+    if (STATE.contract.ready) return "Gotowy";
+    if (STATE.contract.status === "capturing") return "Nasluchiwanie";
+    if (STATE.contract.status === "failed") return "Blad";
+    return "Niegotowy";
+  }
+  function openEditModal(taskId) {
+    const task = findTaskById(taskId);
+    if (!task) return;
+    STATE.edit.open = true;
+    STATE.edit.taskId = task.id;
+    STATE.edit.saving = false;
+    STATE.edit.error = "";
+    STATE.edit.success = "";
+    STATE.edit.draft = {
+      name: task.name || "",
+      dueDateInput: toDateInputValue(task.dueDate),
+      notes: task.notes || "",
+      markDone: Boolean(task.isDone),
+    };
+    STATE.edit.dirty = false;
+    render();
+  }
+  function closeEditModal() {
+    STATE.edit.open = false;
+    STATE.edit.taskId = "";
+    STATE.edit.saving = false;
+    STATE.edit.error = "";
+    STATE.edit.success = "";
+    STATE.edit.dirty = false;
+    STATE.edit.draft = {
+      name: "",
+      dueDateInput: "",
+      notes: "",
+      markDone: false,
+    };
+    render();
+  }
+  function updateEditDraft(field, value) {
+    if (!STATE.edit.open) return;
+    STATE.edit.draft[field] = value;
+    STATE.edit.dirty = true;
+    STATE.edit.error = "";
+    STATE.edit.success = "";
+    render();
+  }
+  function applyLocalTaskPatch(taskId, patch) {
+    if (!taskId || !patch) return;
+    const task = findTaskById(taskId);
+    if (!task) return;
+    Object.keys(patch).forEach((k) => {
+      task[k] = patch[k];
+    });
+  }
+  function convertDueDateBySample(sampleValue, draftDate) {
+    if (!draftDate) return sampleValue === null ? null : "";
+    const dateMidnightIso = `${draftDate}T00:00:00.000Z`;
+    if (typeof sampleValue === "number") {
+      const ms = toMillis(dateMidnightIso);
+      if (!Number.isFinite(ms)) return sampleValue;
+      return sampleValue < 1e12 ? Math.floor(ms / 1000) : ms;
+    }
+    if (typeof sampleValue === "string") {
+      if (/^\d+$/.test(sampleValue)) {
+        const n = Number(sampleValue);
+        const ms = toMillis(dateMidnightIso);
+        if (!Number.isFinite(ms)) return sampleValue;
+        return n < 1e12 ? String(Math.floor(ms / 1000)) : String(ms);
+      }
+      if (sampleValue.includes("T")) return dateMidnightIso;
+      return draftDate;
+    }
+    return dateMidnightIso;
+  }
+  function convertDoneBySample(sampleValue, markDone) {
+    if (typeof sampleValue === "boolean") return Boolean(markDone);
+    if (typeof sampleValue === "number") return markDone ? 1 : 0;
+    if (typeof sampleValue === "string") {
+      const up = sampleValue.toUpperCase();
+      if (["DONE", "COMPLETED", "COMPLETE", "CLOSED"].includes(up)) return markDone ? sampleValue : "OPEN";
+      if (["OPEN", "PENDING", "TODAY", "OVERDUE", "TODO"].includes(up)) return markDone ? "DONE" : sampleValue;
+      if (up === "TRUE" || up === "FALSE") return markDone ? "true" : "false";
+      return markDone ? "DONE" : sampleValue;
+    }
+    return markDone;
+  }
+  function toUnixSecondsFromDateInput(dateInput, fallbackValue) {
+    if (!dateInput) {
+      const fallbackMs = toMillis(fallbackValue);
+      return Number.isFinite(fallbackMs) ? Math.floor(fallbackMs / 1000) : null;
+    }
+    const parsed = new Date(`${dateInput}T23:59:59`);
+    if (Number.isNaN(parsed.getTime())) {
+      const fallbackMs = toMillis(fallbackValue);
+      return Number.isFinite(fallbackMs) ? Math.floor(fallbackMs / 1000) : null;
+    }
+    return Math.floor(parsed.getTime() / 1000);
+  }
+  function buildUpdateUrl(taskId) {
+    if (STATIC_UPDATE_CONTRACT && AUTH.locationId) {
+      return `https://app.glofox.com/task-management-api/v1/locations/${AUTH.locationId}/tasks/${taskId}`;
+    }
+    const sampleUrl = String(STATE.contract.url || "");
+    const sampleId = String(STATE.contract.sampleTaskId || "");
+    if (!sampleUrl) return "";
+    if (sampleId && taskId) return sampleUrl.replace(sampleId, taskId);
+    return sampleUrl;
+  }
+  function buildStaticUpdatePayload(task, draft, authUserId) {
+    const dueSeconds = toUnixSecondsFromDateInput(draft.dueDateInput, task.dueDate);
+    const customerId = deriveCustomerIdFromTask(task);
+    const staffId = deriveStaffIdFromTask(task, authUserId);
+    const payload = {
+      name: text(draft.name),
+      type: text(task.type) || "To-Do",
+      notes: text(draft.notes),
+      due_date: dueSeconds,
+      customer_id: customerId,
+      customer_first_name: text(task.customerFirstName || (task.raw && task.raw.customer && task.raw.customer.first_name)),
+      customer_last_name: text(task.customerLastName || (task.raw && task.raw.customer && task.raw.customer.last_name)),
+      staff_id: staffId,
+    };
+
+    if (draft.markDone && !task.isDone) {
+      payload.completion_date = Math.floor(Date.now() / 1000);
+      payload.completed_by = text(authUserId);
+    }
+    return payload;
+  }
+  function buildStaticUpdatePayloadMinimal(task, draft, authUserId) {
+    const dueSeconds = toUnixSecondsFromDateInput(draft.dueDateInput, task.dueDate);
+    const staffId = deriveStaffIdFromTask(task, authUserId);
+    const payload = {
+      name: text(draft.name),
+      type: text(task.type) || "To-Do",
+      notes: text(draft.notes),
+      due_date: dueSeconds,
+      staff_id: staffId,
+    };
+    if (draft.markDone && !task.isDone) {
+      payload.completion_date = Math.floor(Date.now() / 1000);
+      payload.completed_by = text(authUserId);
+    }
+    return payload;
+  }
+  function buildUpdatePayload(taskId, draft) {
+    if (STATIC_UPDATE_CONTRACT) {
+      const task = findTaskById(taskId);
+      if (!task) return null;
+      return buildStaticUpdatePayload(task, draft, AUTH.userId);
+    }
+    const template = deepClone(STATE.contract.bodyTemplate);
+    if (!template || typeof template !== "object") return null;
+
+    let payload = replaceIdRecursive(template, STATE.contract.sampleTaskId, taskId);
+    const idsInBody = findIdCandidatesInBody(payload);
+    idsInBody.forEach((entry) => {
+      if (entry.value === STATE.contract.sampleTaskId) {
+        setByPath(payload, entry.path, taskId);
+      }
+    });
+
+    const paths = STATE.contract.fieldPaths || {};
+    if (paths.name) {
+      const current = getByPath(payload, paths.name);
+      if (current !== undefined) setByPath(payload, paths.name, draft.name);
+    }
+    if (paths.notes) {
+      const current = getByPath(payload, paths.notes);
+      if (current !== undefined) setByPath(payload, paths.notes, draft.notes);
+    }
+    if (paths.dueDate) {
+      const current = getByPath(payload, paths.dueDate);
+      if (current !== undefined) {
+        setByPath(payload, paths.dueDate, convertDueDateBySample(current, draft.dueDateInput));
+      }
+    }
+    if (paths.done) {
+      const current = getByPath(payload, paths.done);
+      if (current !== undefined) {
+        setByPath(payload, paths.done, convertDoneBySample(current, draft.markDone));
+      }
+    }
+    return payload;
+  }
+  function validateEditDraft(draft) {
+    if (!draft) return "Brak danych formularza.";
+    if (!text(draft.name)) return "Nazwa zadania nie moze byc pusta.";
+    if (draft.dueDateInput && Number.isNaN(new Date(draft.dueDateInput).getTime())) {
+      return "Niepoprawna data terminu.";
+    }
+    return "";
+  }
+  async function executeUpdateRequest(url, method, token, payload) {
+    const res = await fetch(url, {
+      method: method || "PATCH",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/json",
+        "Content-Type": "application/json",
+      },
+      credentials: "include",
+      body: JSON.stringify(payload),
+    });
+
+    if (res.ok) {
+      let json = null;
+      try {
+        json = await res.json();
+      } catch (_e) {
+        // noop
+      }
+      return { ok: true, status: res.status, data: json, code: "", message: "" };
+    }
+
+    let parsed = null;
+    let textBody = "";
+    try {
+      parsed = await res.json();
+    } catch (_e) {
+      try {
+        textBody = await res.text();
+      } catch (_e2) {
+        // noop
+      }
+    }
+    const code = text(parsed && parsed.code);
+    const message = text(parsed && parsed.message) || textBody;
+    return { ok: false, status: res.status, data: parsed, code: code, message: message, sentPayload: payload };
+  }
+  function hasAnyEditablePath() {
+    const p = STATE.contract.fieldPaths || {};
+    return Boolean(p.name || p.dueDate || p.notes || p.done);
+  }
+  async function saveTaskEdit() {
+    if (!STATE.edit.open) return;
+    if (STATE.edit.saving) return;
+    const task = findTaskById(STATE.edit.taskId);
+    if (!task) {
+      STATE.edit.error = "Nie znaleziono taska do zapisu.";
+      render();
+      return;
+    }
+    const validationError = validateEditDraft(STATE.edit.draft);
+    if (validationError) {
+      STATE.edit.error = validationError;
+      render();
+      return;
+    }
+    if (!STATIC_UPDATE_CONTRACT && !STATE.contract.ready) {
+      STATE.edit.error = "Brak kontraktu zapisu. Wykonaj jedna edycje w natywnym panelu Glofox i zapisz.";
+      render();
+      return;
+    }
+    if (!STATIC_UPDATE_CONTRACT && !hasAnyEditablePath()) {
+      STATE.edit.error = "Wykryty kontrakt nie zawiera mapowania pol edycji. Zapisz inny task w natywnym edytorze i sprobuj ponownie.";
+      render();
+      return;
+    }
+
+    const { token } = getAuth();
+    if (!token) {
+      STATE.edit.error = "Brak tokena sesji.";
+      render();
+      return;
+    }
+    const url = buildUpdateUrl(task.id);
+    const payload = buildUpdatePayload(task.id, STATE.edit.draft);
+    if (!url || !payload) {
+      STATE.edit.error = "Nie udalo sie zbudowac requestu zapisu.";
+      render();
+      return;
+    }
+
+    STATE.edit.saving = true;
+    STATE.edit.error = "";
+    STATE.edit.success = "";
+    render();
+    try {
+      STATE.contract.ownRequestInFlight = true;
+      let result = await executeUpdateRequest(url, STATE.contract.method || "PATCH", token, payload);
+      if (!result.ok && result.code === "TASKS_CORE_API_MEMBER_DELETED" && STATIC_UPDATE_CONTRACT) {
+        const minimalPayload = buildStaticUpdatePayloadMinimal(task, STATE.edit.draft, AUTH.userId);
+        result = await executeUpdateRequest(url, STATE.contract.method || "PATCH", token, minimalPayload);
+      }
+      if (!result.ok) {
+        if (result.code === "TASKS_CORE_API_MEMBER_DELETED") {
+          STATE.edit.blockedByApiTaskIds[task.id] = true;
+          const sentCustomerId = text(result.sentPayload && result.sentPayload.customer_id);
+          throw new Error(`API odrzucilo zapis kodem TASKS_CORE_API_MEMBER_DELETED. Wyslany customer_id=${sentCustomerId || "-"}.`);
+        }
+        if (result.code === "TASKS_CORE_API_STAFF_DELETED") {
+          const sentStaffId = text(result.sentPayload && result.sentPayload.staff_id);
+          throw new Error(`API odrzucilo zapis kodem TASKS_CORE_API_STAFF_DELETED. Wyslany staff_id=${sentStaffId || "-"}, auth_user_id=${AUTH.userId || "-"}.`);
+        }
+        const details = text(result.message);
+        throw new Error(`Zapis nie powiodl sie (HTTP ${result.status}). ${details || result.code || ""}`.trim());
+      }
+
+      const updatedDueSeconds = toUnixSecondsFromDateInput(STATE.edit.draft.dueDateInput, task.dueDate);
+      applyLocalTaskPatch(task.id, {
+        name: text(STATE.edit.draft.name),
+        dueDate: Number.isFinite(updatedDueSeconds) ? updatedDueSeconds : task.dueDate,
+        notes: text(STATE.edit.draft.notes),
+        isDone: Boolean(STATE.edit.draft.markDone),
+        completionDate: STATE.edit.draft.markDone ? Math.floor(Date.now() / 1000) : null,
+        statusUi: STATE.edit.draft.markDone ? "DONE" : "PENDING",
+      });
+      applyQuery();
+      STATE.edit.saving = false;
+      STATE.edit.success = "Zapisano.";
+      STATE.edit.dirty = false;
+      render();
+      setTimeout(() => {
+        if (STATE.edit.open && STATE.edit.taskId === task.id && !STATE.edit.dirty) {
+          closeEditModal();
+        }
+      }, 250);
+    } catch (e) {
+      STATE.edit.saving = false;
+      STATE.edit.error = e && e.message ? e.message : "Blad zapisu.";
+      render();
+    } finally {
+      STATE.contract.ownRequestInFlight = false;
+    }
+  }
   function closeModal() {
     STATE.open = false;
+    STATE.edit.open = false;
+    STATE.edit.taskId = "";
+    STATE.edit.saving = false;
+    STATE.edit.error = "";
+    STATE.edit.success = "";
+    STATE.edit.dirty = false;
     const shadow = ensureShadowRoot();
     shadow.innerHTML = "";
     document.body.style.overflow = "";
@@ -587,6 +1378,7 @@
     if (DEBUG) document.body.classList.add("gf-task-filter-debug");
     ensureShadowRoot();
     getAuth();
+    loadContract();
     loadUi();
     ensureUiStateSanity();
     applyQuery();
@@ -600,6 +1392,7 @@
     return `<th><button class="gf-th" data-a="sort" data-sort="${field}">${label}${arrow}</button></th>`;
   }
   function badgeClass(status) {
+    if (status === "DONE") return "gf-tag gf-pending";
     if (status === "TODAY") return "gf-tag gf-today";
     if (status === "OVERDUE") return "gf-tag gf-overdue";
     return "gf-tag gf-pending";
@@ -629,7 +1422,7 @@ safeMode=${STATE.safeMode} | reason=${escapeHtml(reason)}
     const from = total ? (STATE.page - 1) * STATE.ui.pageSize + 1 : 0;
     const to = Math.min(STATE.page * STATE.ui.pageSize, total);
     const rows = pageItems().map((t) => `
-<tr>
+<tr class="gf-row-clickable" data-a="open-edit" data-task-id="${escapeHtml(t.id)}">
 <td title="${escapeHtml(t.name)}">${escapeHtml(t.name || "-")}</td>
 <td>${escapeHtml(t.customerName)}</td>
 <td>${escapeHtml(t.type)}</td>
@@ -640,7 +1433,12 @@ safeMode=${STATE.safeMode} | reason=${escapeHtml(reason)}
 </tr>`).join("");
     const pages = pagesWindow().map((p) => `<button class="gf-page" data-a="page" data-page="${p}" ${p === STATE.page ? 'aria-current="page"' : ""}>${p}</button>`).join("");
     const typeOptions = types().map((v) => `<option value="${escapeHtml(v)}" ${STATE.ui.filters.types.includes(v) ? "selected" : ""}>${escapeHtml(v)}</option>`).join("");
-    const statusOptions = ["PENDING", "TODAY", "OVERDUE"].map((v) => `<option value="${v}" ${STATE.ui.filters.statuses.includes(v) ? "selected" : ""}>${v}</option>`).join("");
+    const statusOptions = ["PENDING", "TODAY", "OVERDUE", "DONE"].map((v) => `<option value="${v}" ${STATE.ui.filters.statuses.includes(v) ? "selected" : ""}>${v}</option>`).join("");
+    const contractHelp = STATIC_UPDATE_CONTRACT
+      ? "Kontrakt zapisu: Gotowy (PATCH /tasks/{taskId})"
+      : STATE.contract.ready
+        ? `Kontrakt zapisu: ${escapeHtml(contractStatusText())} (${escapeHtml(STATE.contract.method)}).`
+        : "Kontrakt zapisu: Niegotowy. Zapisz raz task w natywnym edytorze Glofox, a skrypt automatycznie wykryje endpoint.";
     const tableContent = `
 ${STATE.loading ? '<div class="gf-msg">Ladowanie danych...</div>' : ""}
 ${STATE.error ? `<div class="gf-msg gf-err">${escapeHtml(STATE.error)}</div>` : ""}
@@ -663,6 +1461,7 @@ ${safeListHtml()}`;
     <button class="gf-btn" data-a="close">Zamknij</button>
   </div>
 </div>
+<div class="gf-sub" style="padding:8px 16px;border-bottom:1px solid #ececf6;background:#fff;">${escapeHtml(contractHelp)}</div>
 ${debugPanelHtml()}
 <div class="gf-main">
 ${safe ? "" : `<div class="gf-panel">
@@ -694,6 +1493,67 @@ ${safe ? safeContent : tableContent}
 </div>
 </div>
 </div>
+${editModalHtml()}
+</div>`;
+  }
+  function editModalHtml() {
+    if (!STATE.edit.open) return "";
+    const task = findTaskById(STATE.edit.taskId);
+    if (!task) return "";
+    const canSave = STATE.contract.ready && !STATE.edit.saving;
+    const saveDisabled = !canSave || !STATE.edit.dirty;
+    const statusClass = STATE.edit.error ? "gf-edit-status err" : STATE.edit.success ? "gf-edit-status ok" : "gf-edit-status";
+    const statusText = STATE.edit.error || STATE.edit.success || (STATE.contract.ready ? "Mozesz zapisac zmiany." : "Brak kontraktu zapisu. Uzyj natywnego edytora raz.");
+    return `
+<div class="gf-edit-overlay" data-a="edit-overlay">
+  <div class="gf-edit-modal">
+    <div class="gf-edit-head">
+      <div>
+        <div class="gf-edit-title">Edycja zadania</div>
+        <div class="gf-edit-sub">ID: ${escapeHtml(task.id)} | Kontrakt: ${escapeHtml(contractStatusText())}</div>
+      </div>
+      <div class="gf-actions">
+        <button class="gf-btn" data-a="edit-cancel">Anuluj</button>
+        <button class="gf-btn gf-primary" data-a="edit-save" ${saveDisabled ? "disabled" : ""}>${STATE.edit.saving ? "Zapisywanie..." : "Zapisz"}</button>
+      </div>
+    </div>
+    <div class="gf-edit-body">
+      <div class="gf-edit-field gf-edit-full">
+        <label>Nazwa zadania</label>
+        <input data-edit-field="name" value="${escapeHtml(STATE.edit.draft.name)}">
+      </div>
+      <div class="gf-edit-field">
+        <label>Termin wykonalosci</label>
+        <input type="date" data-edit-field="dueDateInput" value="${escapeHtml(STATE.edit.draft.dueDateInput)}">
+      </div>
+      <div class="gf-edit-field">
+        <label>Typ zadania</label>
+        <div class="gf-edit-ro">${escapeHtml(task.type || "-")}</div>
+      </div>
+      <div class="gf-edit-field">
+        <label>Klient</label>
+        <div class="gf-edit-ro">${escapeHtml(task.customerName || "-")}</div>
+      </div>
+      <div class="gf-edit-field">
+        <label>Przypisano do</label>
+        <div class="gf-edit-ro">${escapeHtml(task.staffName || "-")}</div>
+      </div>
+      <div class="gf-edit-field gf-edit-full">
+        <label>Uwagi</label>
+        <textarea data-edit-field="notes">${escapeHtml(STATE.edit.draft.notes || "")}</textarea>
+      </div>
+      <div class="gf-edit-full">
+        <label class="gf-check">
+          <input type="checkbox" data-edit-field="markDone" ${STATE.edit.draft.markDone ? "checked" : ""}>
+          Ustaw jako wykonane
+        </label>
+      </div>
+    </div>
+    <div class="gf-edit-foot">
+      <div class="${statusClass}">${escapeHtml(statusText)}</div>
+      <div class="gf-edit-status">${STATE.edit.dirty ? "Zmiany oczekuja na zapis." : "Brak zmian."}</div>
+    </div>
+  </div>
 </div>`;
   }
   function collectRenderDebug(root) {
@@ -769,6 +1629,28 @@ ${safe ? safeContent : tableContent}
     if (refresh) refresh.addEventListener("click", () => fetchTasks(true));
     const reset = root.querySelector('[data-a="reset"]');
     if (reset) reset.addEventListener("click", resetFilters);
+    const editOverlay = root.querySelector('[data-a="edit-overlay"]');
+    if (editOverlay) {
+      editOverlay.addEventListener("click", (e) => {
+        if (e.target === editOverlay && !STATE.edit.saving) closeEditModal();
+      });
+    }
+    const editCancel = root.querySelector('[data-a="edit-cancel"]');
+    if (editCancel) editCancel.addEventListener("click", () => {
+      if (STATE.edit.saving) return;
+      closeEditModal();
+    });
+    const editSave = root.querySelector('[data-a="edit-save"]');
+    if (editSave) editSave.addEventListener("click", saveTaskEdit);
+    root.querySelectorAll("[data-edit-field]").forEach((el) => {
+      const field = el.getAttribute("data-edit-field");
+      if (!field) return;
+      if (field === "markDone") {
+        el.addEventListener("change", (e) => updateEditDraft(field, Boolean(e.target.checked)));
+      } else {
+        el.addEventListener("input", (e) => updateEditDraft(field, e.target.value));
+      }
+    });
 
     root.querySelectorAll("[data-f]").forEach((el) => {
       el.addEventListener("input", (e) => setFilter(e.target.getAttribute("data-f"), e.target.value));
@@ -789,6 +1671,12 @@ ${safe ? safeContent : tableContent}
     root.querySelectorAll("[data-a]").forEach((el) => {
       const a = el.getAttribute("data-a");
       if (a === "sort") el.addEventListener("click", (e) => toggleSort(e.currentTarget.getAttribute("data-sort")));
+      if (a === "open-edit") {
+        el.addEventListener("click", (e) => {
+          const id = e.currentTarget.getAttribute("data-task-id");
+          if (id) openEditModal(id);
+        });
+      }
       if (a === "first") el.addEventListener("click", () => { STATE.page = 1; render(); });
       if (a === "prev") el.addEventListener("click", () => { STATE.page = Math.max(1, STATE.page - 1); render(); });
       if (a === "next") el.addEventListener("click", () => { STATE.page = Math.min(STATE.pages, STATE.page + 1); render(); });
@@ -800,7 +1688,7 @@ ${safe ? safeContent : tableContent}
     if (!root) return null;
     const active = root.activeElement;
     if (!active || !(active instanceof HTMLElement)) return null;
-    if (!active.matches("[data-f], [data-fm], [data-a='size']")) return null;
+    if (!active.matches("[data-f], [data-fm], [data-a='size'], [data-edit-field]")) return null;
 
     const state = {
       key: "",
@@ -813,6 +1701,8 @@ ${safe ? safeContent : tableContent}
       state.key = `f:${active.getAttribute("data-f")}`;
     } else if (active.hasAttribute("data-fm")) {
       state.key = `fm:${active.getAttribute("data-fm")}`;
+    } else if (active.hasAttribute("data-edit-field")) {
+      state.key = `ef:${active.getAttribute("data-edit-field")}`;
     } else if (active.getAttribute("data-a") === "size") {
       state.key = "a:size";
     } else {
@@ -821,7 +1711,7 @@ ${safe ? safeContent : tableContent}
 
     if ("value" in active) state.value = active.value;
     if (
-      active instanceof HTMLInputElement &&
+      (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) &&
       typeof active.selectionStart === "number" &&
       typeof active.selectionEnd === "number"
     ) {
@@ -839,13 +1729,16 @@ ${safe ? safeContent : tableContent}
     } else if (state.key.startsWith("fm:")) {
       const key = state.key.slice(3);
       target = root.querySelector(`[data-fm="${CSS.escape(key)}"]`);
+    } else if (state.key.startsWith("ef:")) {
+      const key = state.key.slice(3);
+      target = root.querySelector(`[data-edit-field="${CSS.escape(key)}"]`);
     } else if (state.key === "a:size") {
       target = root.querySelector('[data-a="size"]');
     }
     if (!target || !(target instanceof HTMLElement)) return;
     target.focus();
     if (
-      target instanceof HTMLInputElement &&
+      (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
       typeof state.start === "number" &&
       typeof state.end === "number"
     ) {
@@ -906,8 +1799,14 @@ ${safe ? safeContent : tableContent}
     window.__GF_TASK_FILTER_BOOTSTRAPPED__ = true;
     ensureStyle();
     ensureAuthHooks();
+    loadContract();
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && STATE.open) closeModal();
+      if (e.key !== "Escape") return;
+      if (STATE.edit.open) {
+        if (!STATE.edit.saving) closeEditModal();
+        return;
+      }
+      if (STATE.open) closeModal();
     });
     const obs = new MutationObserver(() => { if (isTasksPage()) ensureButton(); else removeButton(); });
     obs.observe(document.body, { childList: true, subtree: true });
