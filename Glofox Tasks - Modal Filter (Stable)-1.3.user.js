@@ -60,7 +60,6 @@
         name: "",
         dueDateInput: "",
         notes: "",
-        markDone: false,
       },
       dirty: false,
       blockedByApiTaskIds: {},
@@ -1006,6 +1005,8 @@
 .gf-btn.gf-primary{border-color:#5f63e9;background:#5f63e9;color:#fff}.gf-btn:disabled{opacity:.55;cursor:not-allowed}
 .gf-btn.gf-danger{border-color:#d64545;background:#d64545;color:#fff}
 .gf-btn.gf-danger:hover:not(:disabled){filter:brightness(.95)}
+.gf-btn.gf-success{border-color:#1e7d3f;background:#1e7d3f;color:#fff}
+.gf-btn.gf-success:hover:not(:disabled){filter:brightness(.95)}
 .gf-main{display:flex;flex-direction:column;min-height:0;flex:1}
 .gf-panel{padding:10px 14px;border-bottom:1px solid #ececf6}.gf-grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:8px}
 .gf-field{display:flex;flex-direction:column;gap:4px}.gf-field label{font-size:11px;color:#5a5f82;font-weight:600}
@@ -1040,7 +1041,6 @@
 .gf-edit-status{font-size:12px;color:#5a6088}
 .gf-edit-status.err{color:#b4233f}
 .gf-edit-status.ok{color:#1e7d3f}
-.gf-check{display:flex;align-items:center;gap:8px;font-size:13px;color:#2b2f62}
 .gf-confirm-overlay{position:fixed;inset:0;background:rgba(6,10,20,.5);display:flex;align-items:center;justify-content:center;padding:20px;z-index:100002}
 .gf-confirm-modal{width:min(520px,94vw);background:#fff;border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.25);padding:16px}
 .gf-confirm-title{font-size:16px;font-weight:700;color:#202442}
@@ -1347,7 +1347,6 @@
       name: task.name || "",
       dueDateInput: toIsoDateValue(task.dueDate),
       notes: task.notes || "",
-      markDone: Boolean(task.isDone),
     };
     closeCalendar();
     STATE.edit.dirty = false;
@@ -1367,7 +1366,6 @@
       name: "",
       dueDateInput: "",
       notes: "",
-      markDone: false,
     };
     closeCalendar();
     render();
@@ -1422,18 +1420,6 @@
     }
     return dateMidnightIso;
   }
-  function convertDoneBySample(sampleValue, markDone) {
-    if (typeof sampleValue === "boolean") return Boolean(markDone);
-    if (typeof sampleValue === "number") return markDone ? 1 : 0;
-    if (typeof sampleValue === "string") {
-      const up = sampleValue.toUpperCase();
-      if (["DONE", "COMPLETED", "COMPLETE", "CLOSED"].includes(up)) return markDone ? sampleValue : "OPEN";
-      if (["OPEN", "PENDING", "TODAY", "OVERDUE", "TODO"].includes(up)) return markDone ? "DONE" : sampleValue;
-      if (up === "TRUE" || up === "FALSE") return markDone ? "true" : "false";
-      return markDone ? "DONE" : sampleValue;
-    }
-    return markDone;
-  }
   function toUnixSecondsFromDateInput(dateInput, fallbackValue) {
     if (!dateInput) {
       const fallbackMs = toMillis(fallbackValue);
@@ -1471,10 +1457,6 @@
       staff_id: staffId,
     };
 
-    if (draft.markDone && !task.isDone) {
-      payload.completion_date = Math.floor(Date.now() / 1000);
-      payload.completed_by = text(authUserId);
-    }
     return payload;
   }
   function buildStaticUpdatePayloadMinimal(task, draft, authUserId) {
@@ -1487,10 +1469,6 @@
       due_date: dueSeconds,
       staff_id: staffId,
     };
-    if (draft.markDone && !task.isDone) {
-      payload.completion_date = Math.floor(Date.now() / 1000);
-      payload.completed_by = text(authUserId);
-    }
     return payload;
   }
   function buildUpdatePayload(taskId, draft) {
@@ -1523,12 +1501,6 @@
       const current = getByPath(payload, paths.dueDate);
       if (current !== undefined) {
         setByPath(payload, paths.dueDate, convertDueDateBySample(current, draft.dueDateInput));
-      }
-    }
-    if (paths.done) {
-      const current = getByPath(payload, paths.done);
-      if (current !== undefined) {
-        setByPath(payload, paths.done, convertDoneBySample(current, draft.markDone));
       }
     }
     return payload;
@@ -1600,7 +1572,7 @@
     if (STATE.edit.saving || STATE.edit.deleting) return;
     const task = findTaskById(STATE.edit.taskId);
     if (!task) {
-      STATE.edit.deleteError = "Nie znaleziono taska do usuniecia.";
+      STATE.edit.deleteError = "Nie znaleziono taska do oznaczenia jako zrobione.";
       render();
       return;
     }
@@ -1618,17 +1590,17 @@
           throw new Error("Brak autoryzacji (401/403). Odswiez sesje i sprobuj ponownie.");
         }
         const details = text(result.message);
-        throw new Error(`Usuniecie nie powiodlo sie (HTTP ${result.status || "-"}). ${details || result.code || ""}`.trim());
+        throw new Error(`Oznaczenie jako zrobione nie powiodlo sie (HTTP ${result.status || "-"}). ${details || result.code || ""}`.trim());
       }
 
       STATE.all = STATE.all.filter((x) => x.id !== task.id);
       markAllDataChanged();
       applyQuery();
-      STATE.notice = "Zadanie usuniete.";
+      STATE.notice = "Zadanie oznaczone jako zrobione.";
       closeEditModal();
     } catch (e) {
       STATE.edit.deleting = false;
-      STATE.edit.deleteError = e && e.message ? e.message : "Blad usuwania.";
+      STATE.edit.deleteError = e && e.message ? e.message : "Blad oznaczania jako zrobione.";
       render();
     } finally {
       STATE.contract.ownRequestInFlight = false;
@@ -1636,7 +1608,7 @@
   }
   function hasAnyEditablePath() {
     const p = STATE.contract.fieldPaths || {};
-    return Boolean(p.name || p.dueDate || p.notes || p.done);
+    return Boolean(p.name || p.dueDate || p.notes);
   }
   async function saveTaskEdit() {
     if (!STATE.edit.open) return;
@@ -1708,9 +1680,6 @@
         name: text(STATE.edit.draft.name),
         dueDate: Number.isFinite(updatedDueSeconds) ? updatedDueSeconds : task.dueDate,
         notes: text(STATE.edit.draft.notes),
-        isDone: Boolean(STATE.edit.draft.markDone),
-        completionDate: STATE.edit.draft.markDone ? Math.floor(Date.now() / 1000) : null,
-        statusUi: STATE.edit.draft.markDone ? "DONE" : "PENDING",
       });
       applyQuery();
       STATE.edit.saving = false;
@@ -1956,7 +1925,7 @@ ${editModalHtml()}
         <div class="gf-edit-sub">ID: ${escapeHtml(task.id)} | Kontrakt: ${escapeHtml(contractStatusText())}</div>
       </div>
       <div class="gf-actions">
-        <button class="gf-btn gf-danger" data-a="edit-delete" ${deleteDisabled ? "disabled" : ""}>Usun</button>
+        <button class="gf-btn gf-success" data-a="edit-delete" ${deleteDisabled ? "disabled" : ""}>Zrobione</button>
         <button class="gf-btn" data-a="edit-cancel">Anuluj</button>
         <button class="gf-btn gf-primary" data-a="edit-save" ${saveDisabled ? "disabled" : ""}>${STATE.edit.saving ? "Zapisywanie..." : "Zapisz"}</button>
       </div>
@@ -1986,12 +1955,6 @@ ${editModalHtml()}
         <label>Uwagi</label>
         <textarea data-edit-field="notes">${escapeHtml(STATE.edit.draft.notes || "")}</textarea>
       </div>
-      <div class="gf-edit-full">
-        <label class="gf-check">
-          <input type="checkbox" data-edit-field="markDone" ${STATE.edit.draft.markDone ? "checked" : ""}>
-          Ustaw jako wykonane
-        </label>
-      </div>
     </div>
     <div class="gf-edit-foot">
       <div class="${statusClass}">${escapeHtml(statusText)}</div>
@@ -2007,12 +1970,12 @@ ${confirmHtml}`;
     return `
 <div class="gf-confirm-overlay" data-a="delete-overlay">
   <div class="gf-confirm-modal">
-    <div class="gf-confirm-title">Potwierdzenie usuniecia</div>
-    <div class="gf-confirm-text">Czy na pewno chcesz usunac to zadanie?!</div>
+    <div class="gf-confirm-title">Potwierdzenie oznaczenia</div>
+    <div class="gf-confirm-text">Czy na pewno chcesz oznaczyc to zadanie jako zrobione?</div>
     ${err ? `<div class="gf-edit-status err" style="margin-top:10px;">${escapeHtml(err)}</div>` : ""}
     <div class="gf-confirm-actions">
       <button class="gf-btn" data-a="delete-cancel" ${busy ? "disabled" : ""}>Anuluj</button>
-      <button class="gf-btn gf-danger" data-a="delete-confirm" ${busy ? "disabled" : ""}>${busy ? "Usuwanie..." : "Tak, usun"}</button>
+      <button class="gf-btn gf-success" data-a="delete-confirm" ${busy ? "disabled" : ""}>${busy ? "Oznaczanie..." : "Tak, oznacz jako zrobione"}</button>
     </div>
   </div>
 </div>`;
@@ -2274,9 +2237,7 @@ ${confirmHtml}`;
     editFields.forEach((el) => {
       const field = el.getAttribute("data-edit-field");
       if (!field) return;
-      if (field === "markDone") {
-        el.addEventListener("change", (e) => updateEditDraft(field, Boolean(e.target.checked)));
-      } else if (isDateEditField(field)) {
+      if (isDateEditField(field)) {
         // Date text inputs are handled by [data-date-input] flow.
       } else {
         el.addEventListener("input", (e) => updateEditDraft(field, e.target.value));
