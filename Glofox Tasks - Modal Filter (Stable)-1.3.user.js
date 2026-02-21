@@ -1188,15 +1188,37 @@
   }
   function openCalendarForField(field, anchorEl) {
     if (!isCalendarDateField(field)) return;
+    const openedAt = new Date().toISOString();
     setCalendarAnchorFromElement(anchorEl);
     const sameField = STATE.calendar.open && STATE.calendar.targetField === field;
-    if (sameField) return;
+    if (sameField) {
+      console.log("[GF_CAL_DEBUG]", openedAt, "event=openCalendarForField:sameField", {
+        field,
+        currentMonth: `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`,
+      });
+      return;
+    }
+    const sourceIso = calendarFieldIsoValue(field);
     setCalendarMonthFromIso(calendarFieldIsoValue(field));
+    console.log("[GF_CAL_DEBUG]", openedAt, "event=openCalendarForField:resetFromInput", {
+      field,
+      sourceIso,
+      targetMonth: `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`,
+    });
     STATE.calendar.targetField = field;
     STATE.calendar.open = true;
     STATE.calendar.error = "";
     STATE.calendar.suppressBlurCommit = false;
     scheduleRender();
+  }
+  function isCalendarAction(action) {
+    return action === "cal-prev" || action === "cal-next" || action === "cal-today" || action === "cal-clear" || action === "cal-day";
+  }
+  function isCalendarDateFocusKey(key) {
+    if (!key) return false;
+    if (key.startsWith("f:")) return isDateFilterKey(key.slice(2));
+    if (key.startsWith("ef:")) return isDateEditField(key.slice(3));
+    return false;
   }
   function applyDateFieldIso(field, isoValue) {
     if (!isCalendarDateField(field)) return;
@@ -1239,6 +1261,16 @@
     return cells;
   }
   function onCalendarPrevMonth() {
+    const ts = new Date().toISOString();
+    const currentMonth = `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`;
+    let targetMonthIndex = STATE.calendar.month - 1;
+    let targetYear = STATE.calendar.year;
+    if (targetMonthIndex < 0) {
+      targetMonthIndex = 11;
+      targetYear -= 1;
+    }
+    const targetMonth = `${CALENDAR_MONTH_NAMES_PL[targetMonthIndex]} ${targetYear}`;
+    console.log("[GF_CAL_DEBUG]", ts, "event=click month prev", { currentMonth, targetMonth });
     STATE.calendar.month -= 1;
     if (STATE.calendar.month < 0) {
       STATE.calendar.month = 11;
@@ -1247,6 +1279,16 @@
     scheduleRender();
   }
   function onCalendarNextMonth() {
+    const ts = new Date().toISOString();
+    const currentMonth = `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`;
+    let targetMonthIndex = STATE.calendar.month + 1;
+    let targetYear = STATE.calendar.year;
+    if (targetMonthIndex > 11) {
+      targetMonthIndex = 0;
+      targetYear += 1;
+    }
+    const targetMonth = `${CALENDAR_MONTH_NAMES_PL[targetMonthIndex]} ${targetYear}`;
+    console.log("[GF_CAL_DEBUG]", ts, "event=click month next", { currentMonth, targetMonth });
     STATE.calendar.month += 1;
     if (STATE.calendar.month > 11) {
       STATE.calendar.month = 0;
@@ -2100,130 +2142,145 @@ ${confirmHtml}`;
         scheduleRender();
       });
     }
-    root.addEventListener("mousedown", (e) => {
-      const actionEl = getActionTarget(root, e);
-      if (!actionEl) return;
-      const action = actionEl.getAttribute("data-a");
-      if (action === "cal-prev" || action === "cal-next" || action === "cal-today" || action === "cal-clear" || action === "cal-day") {
-        STATE.calendar.suppressBlurCommit = true;
-      }
-    });
-    root.addEventListener("click", (e) => {
-      const actionEl = getActionTarget(root, e);
-      if (!actionEl) return;
-      const action = actionEl.getAttribute("data-a");
-      if (!action) return;
+    if (!root.__gfDelegatedEventsBound) {
+      root.addEventListener("mousedown", (e) => {
+        const actionEl = getActionTarget(root, e);
+        if (!actionEl) return;
+        const action = actionEl.getAttribute("data-a");
+        if (isCalendarAction(action)) {
+          STATE.calendar.suppressBlurCommit = true;
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      });
+      root.addEventListener("click", (e) => {
+        const actionEl = getActionTarget(root, e);
+        if (!actionEl) return;
+        const action = actionEl.getAttribute("data-a");
+        if (!action) return;
 
-      if (action === "edit-overlay") {
-        if (e.target === actionEl && !STATE.edit.saving && !STATE.edit.deleting) closeEditModal();
-        return;
-      }
-      if (action === "delete-overlay") {
-        if (e.target === actionEl && !STATE.edit.deleting) closeDeleteConfirm();
-        return;
-      }
+        if (action === "edit-overlay") {
+          if (e.target === actionEl && !STATE.edit.saving && !STATE.edit.deleting) closeEditModal();
+          return;
+        }
+        if (action === "delete-overlay") {
+          if (e.target === actionEl && !STATE.edit.deleting) closeDeleteConfirm();
+          return;
+        }
 
-      if (action === "close") {
-        closeModal();
-        return;
-      }
-      if (action === "refresh") {
-        fetchTasks(true);
-        return;
-      }
-      if (action === "reset") {
-        resetFilters();
-        return;
-      }
-      if (action === "sort") {
-        toggleSort(actionEl.getAttribute("data-sort"));
-        return;
-      }
-      if (action === "open-edit") {
-        const id = actionEl.getAttribute("data-task-id");
-        if (id) openEditModal(id);
-        return;
-      }
-      if (action === "edit-cancel") {
-        if (STATE.edit.saving || STATE.edit.deleting) return;
-        closeEditModal();
-        return;
-      }
-      if (action === "edit-delete") {
-        openDeleteConfirm();
-        return;
-      }
-      if (action === "edit-save") {
-        saveTaskEdit();
-        return;
-      }
-      if (action === "delete-cancel") {
-        closeDeleteConfirm();
-        return;
-      }
-      if (action === "delete-confirm") {
-        confirmDeleteTask();
-        return;
-      }
-      if (action === "cal-prev") {
-        onCalendarPrevMonth();
-        STATE.calendar.suppressBlurCommit = false;
-        return;
-      }
-      if (action === "cal-next") {
-        onCalendarNextMonth();
-        STATE.calendar.suppressBlurCommit = false;
-        return;
-      }
-      if (action === "cal-today") {
-        onCalendarToday();
-        STATE.calendar.suppressBlurCommit = false;
-        return;
-      }
-      if (action === "cal-clear") {
-        onCalendarClear();
-        STATE.calendar.suppressBlurCommit = false;
-        return;
-      }
-      if (action === "cal-day") {
-        const day = Number(actionEl.getAttribute("data-day"));
-        if (Number.isFinite(day) && day > 0) onCalendarSelectDay(day);
-        STATE.calendar.suppressBlurCommit = false;
-        return;
-      }
-      if (action === "first") {
-        if (STATE.page === 1) return;
-        STATE.page = 1;
-        scheduleRender();
-        return;
-      }
-      if (action === "prev") {
-        const nextPage = Math.max(1, STATE.page - 1);
-        if (nextPage === STATE.page) return;
-        STATE.page = nextPage;
-        scheduleRender();
-        return;
-      }
-      if (action === "next") {
-        const nextPage = Math.min(STATE.pages, STATE.page + 1);
-        if (nextPage === STATE.page) return;
-        STATE.page = nextPage;
-        scheduleRender();
-        return;
-      }
-      if (action === "last") {
-        if (STATE.page === STATE.pages) return;
-        STATE.page = STATE.pages;
-        scheduleRender();
-        return;
-      }
-      if (action === "page") {
-        const targetPage = Number(actionEl.getAttribute("data-page")) || 1;
-        if (targetPage === STATE.page) return;
-        STATE.page = targetPage;
-        scheduleRender();
-      }
-    });
+        if (action === "close") {
+          closeModal();
+          return;
+        }
+        if (action === "refresh") {
+          fetchTasks(true);
+          return;
+        }
+        if (action === "reset") {
+          resetFilters();
+          return;
+        }
+        if (action === "sort") {
+          toggleSort(actionEl.getAttribute("data-sort"));
+          return;
+        }
+        if (action === "open-edit") {
+          const id = actionEl.getAttribute("data-task-id");
+          if (id) openEditModal(id);
+          return;
+        }
+        if (action === "edit-cancel") {
+          if (STATE.edit.saving || STATE.edit.deleting) return;
+          closeEditModal();
+          return;
+        }
+        if (action === "edit-delete") {
+          openDeleteConfirm();
+          return;
+        }
+        if (action === "edit-save") {
+          saveTaskEdit();
+          return;
+        }
+        if (action === "delete-cancel") {
+          closeDeleteConfirm();
+          return;
+        }
+        if (action === "delete-confirm") {
+          confirmDeleteTask();
+          return;
+        }
+        if (action === "cal-prev") {
+          e.preventDefault();
+          e.stopPropagation();
+          onCalendarPrevMonth();
+          STATE.calendar.suppressBlurCommit = false;
+          return;
+        }
+        if (action === "cal-next") {
+          e.preventDefault();
+          e.stopPropagation();
+          onCalendarNextMonth();
+          STATE.calendar.suppressBlurCommit = false;
+          return;
+        }
+        if (action === "cal-today") {
+          e.preventDefault();
+          e.stopPropagation();
+          onCalendarToday();
+          STATE.calendar.suppressBlurCommit = false;
+          return;
+        }
+        if (action === "cal-clear") {
+          e.preventDefault();
+          e.stopPropagation();
+          onCalendarClear();
+          STATE.calendar.suppressBlurCommit = false;
+          return;
+        }
+        if (action === "cal-day") {
+          e.preventDefault();
+          e.stopPropagation();
+          const day = Number(actionEl.getAttribute("data-day"));
+          if (Number.isFinite(day) && day > 0) onCalendarSelectDay(day);
+          STATE.calendar.suppressBlurCommit = false;
+          return;
+        }
+        if (action === "first") {
+          if (STATE.page === 1) return;
+          STATE.page = 1;
+          scheduleRender();
+          return;
+        }
+        if (action === "prev") {
+          const nextPage = Math.max(1, STATE.page - 1);
+          if (nextPage === STATE.page) return;
+          STATE.page = nextPage;
+          scheduleRender();
+          return;
+        }
+        if (action === "next") {
+          const nextPage = Math.min(STATE.pages, STATE.page + 1);
+          if (nextPage === STATE.page) return;
+          STATE.page = nextPage;
+          scheduleRender();
+          return;
+        }
+        if (action === "last") {
+          if (STATE.page === STATE.pages) return;
+          STATE.page = STATE.pages;
+          scheduleRender();
+          return;
+        }
+        if (action === "page") {
+          const targetPage = Number(actionEl.getAttribute("data-page")) || 1;
+          if (targetPage === STATE.page) return;
+          STATE.page = targetPage;
+          scheduleRender();
+        }
+      });
+      root.__gfDelegatedEventsBound = true;
+    }
 
     const dateInputs = root.querySelectorAll("[data-date-input]");
     dateInputs.forEach((el) => {
@@ -2323,6 +2380,13 @@ ${confirmHtml}`;
   }
   function restoreFocusState(root, state) {
     if (!root || !state || !state.key) return;
+    if (STATE.calendar.open && isCalendarDateFocusKey(state.key)) {
+      console.log("[GF_CAL_DEBUG]", new Date().toISOString(), "event=restoreFocusState:blockedForDateField", {
+        key: state.key,
+        month: `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`,
+      });
+      return;
+    }
     let target = null;
     if (state.key.startsWith("f:")) {
       const key = state.key.slice(2);
@@ -2427,4 +2491,3 @@ ${confirmHtml}`;
 
   bootstrap();
 })();
-
