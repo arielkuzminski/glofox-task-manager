@@ -190,12 +190,7 @@
   }
   function debugLog() {
     if (!DEBUG) return;
-    try {
-      // eslint-disable-next-line no-console
-      console.log("[GF-TASK-FILTER]", ...arguments);
-    } catch (_e) {
-      // noop
-    }
+    // Logging intentionally disabled in stable build.
   }
   function ensureUiStateSanity() {
     if (!STATE.ui || typeof STATE.ui !== "object") STATE.ui = defaults();
@@ -1188,23 +1183,10 @@
   }
   function openCalendarForField(field, anchorEl) {
     if (!isCalendarDateField(field)) return;
-    const openedAt = new Date().toISOString();
     setCalendarAnchorFromElement(anchorEl);
     const sameField = STATE.calendar.open && STATE.calendar.targetField === field;
-    if (sameField) {
-      console.log("[GF_CAL_DEBUG]", openedAt, "event=openCalendarForField:sameField", {
-        field,
-        currentMonth: `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`,
-      });
-      return;
-    }
-    const sourceIso = calendarFieldIsoValue(field);
+    if (sameField) return;
     setCalendarMonthFromIso(calendarFieldIsoValue(field));
-    console.log("[GF_CAL_DEBUG]", openedAt, "event=openCalendarForField:resetFromInput", {
-      field,
-      sourceIso,
-      targetMonth: `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`,
-    });
     STATE.calendar.targetField = field;
     STATE.calendar.open = true;
     STATE.calendar.error = "";
@@ -1261,16 +1243,6 @@
     return cells;
   }
   function onCalendarPrevMonth() {
-    const ts = new Date().toISOString();
-    const currentMonth = `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`;
-    let targetMonthIndex = STATE.calendar.month - 1;
-    let targetYear = STATE.calendar.year;
-    if (targetMonthIndex < 0) {
-      targetMonthIndex = 11;
-      targetYear -= 1;
-    }
-    const targetMonth = `${CALENDAR_MONTH_NAMES_PL[targetMonthIndex]} ${targetYear}`;
-    console.log("[GF_CAL_DEBUG]", ts, "event=click month prev", { currentMonth, targetMonth });
     STATE.calendar.month -= 1;
     if (STATE.calendar.month < 0) {
       STATE.calendar.month = 11;
@@ -1279,16 +1251,6 @@
     scheduleRender();
   }
   function onCalendarNextMonth() {
-    const ts = new Date().toISOString();
-    const currentMonth = `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`;
-    let targetMonthIndex = STATE.calendar.month + 1;
-    let targetYear = STATE.calendar.year;
-    if (targetMonthIndex > 11) {
-      targetMonthIndex = 0;
-      targetYear += 1;
-    }
-    const targetMonth = `${CALENDAR_MONTH_NAMES_PL[targetMonthIndex]} ${targetYear}`;
-    console.log("[GF_CAL_DEBUG]", ts, "event=click month next", { currentMonth, targetMonth });
     STATE.calendar.month += 1;
     if (STATE.calendar.month > 11) {
       STATE.calendar.month = 0;
@@ -2380,13 +2342,7 @@ ${confirmHtml}`;
   }
   function restoreFocusState(root, state) {
     if (!root || !state || !state.key) return;
-    if (STATE.calendar.open && isCalendarDateFocusKey(state.key)) {
-      console.log("[GF_CAL_DEBUG]", new Date().toISOString(), "event=restoreFocusState:blockedForDateField", {
-        key: state.key,
-        month: `${CALENDAR_MONTH_NAMES_PL[STATE.calendar.month]} ${STATE.calendar.year}`,
-      });
-      return;
-    }
+    if (STATE.calendar.open && isCalendarDateFocusKey(state.key)) return;
     let target = null;
     if (state.key.startsWith("f:")) {
       const key = state.key.slice(2);
