@@ -40,6 +40,12 @@
     filtered: [],
     page: 1,
     pages: 1,
+    renderQueued: false,
+    dataVersion: 0,
+    cache: {
+      typesDataVersion: -1,
+      typesValues: [],
+    },
     ui: defaults(),
     edit: {
       open: false,
@@ -126,6 +132,23 @@
 
   function isTasksPage() {
     return (location.hash || "").includes("/tasks");
+  }
+  function scheduleRender() {
+    if (STATE.renderQueued) return;
+    STATE.renderQueued = true;
+    const flush = () => {
+      STATE.renderQueued = false;
+      render();
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(flush);
+      return;
+    }
+    setTimeout(flush, 0);
+  }
+  function markAllDataChanged() {
+    STATE.dataVersion += 1;
+    STATE.cache.typesDataVersion = -1;
   }
   function text(v) {
     return String(v || "").trim();
@@ -246,7 +269,7 @@
     return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
   }
   function parseDmyToIso(value) {
-    const raw = text(value).trim();
+    const raw = text(value);
     if (!raw) return "";
     if (/^\d{8}$/.test(raw)) {
       const dd = raw.slice(0, 2);
@@ -838,34 +861,42 @@
   }
   function applyQuery() {
     const f = STATE.ui.filters;
-    let out = STATE.all.slice();
-    if (f.qName) out = out.filter((x) => lower(x.name).includes(lower(f.qName)));
-    if (f.qCustomer) out = out.filter((x) => lower(x.customerName).includes(lower(f.qCustomer)));
-    if (f.qCreator) out = out.filter((x) => lower(x.createdByName).includes(lower(f.qCreator)));
-    if (f.qAssignee) out = out.filter((x) => lower(x.staffName).includes(lower(f.qAssignee)));
-    if (f.statuses.length) out = out.filter((x) => f.statuses.includes(x.statusUi));
-    if (f.types.length) out = out.filter((x) => f.types.includes(x.type));
+    const qName = lower(f.qName);
+    const qCustomer = lower(f.qCustomer);
+    const qCreator = lower(f.qCreator);
+    const qAssignee = lower(f.qAssignee);
+    const statusSet = f.statuses.length ? new Set(f.statuses) : null;
+    const typeSet = f.types.length ? new Set(f.types) : null;
+
+    let dueFromMs = Number.NaN;
     if (f.dueFrom) {
       const from = new Date(f.dueFrom);
-      if (!Number.isNaN(from.getTime())) {
-        const fromMs = from.getTime();
-        out = out.filter((x) => {
-          const dueMs = toMillis(x.dueDate);
-          return Number.isFinite(dueMs) && dueMs >= fromMs;
-        });
-      }
+      if (!Number.isNaN(from.getTime())) dueFromMs = from.getTime();
     }
+    let dueToMs = Number.NaN;
     if (f.dueTo) {
       const to = new Date(f.dueTo);
       to.setHours(23, 59, 59, 999);
-      if (!Number.isNaN(to.getTime())) {
-        const toMs = to.getTime();
-        out = out.filter((x) => {
-          const dueMs = toMillis(x.dueDate);
-          return Number.isFinite(dueMs) && dueMs <= toMs;
-        });
-      }
+      if (!Number.isNaN(to.getTime())) dueToMs = to.getTime();
     }
+    const hasDueFrom = Number.isFinite(dueFromMs);
+    const hasDueTo = Number.isFinite(dueToMs);
+
+    const out = STATE.all.filter((x) => {
+      if (qName && !lower(x.name).includes(qName)) return false;
+      if (qCustomer && !lower(x.customerName).includes(qCustomer)) return false;
+      if (qCreator && !lower(x.createdByName).includes(qCreator)) return false;
+      if (qAssignee && !lower(x.staffName).includes(qAssignee)) return false;
+      if (statusSet && !statusSet.has(x.statusUi)) return false;
+      if (typeSet && !typeSet.has(x.type)) return false;
+      if (hasDueFrom || hasDueTo) {
+        const dueMs = toMillis(x.dueDate);
+        if (!Number.isFinite(dueMs)) return false;
+        if (hasDueFrom && dueMs < dueFromMs) return false;
+        if (hasDueTo && dueMs > dueToMs) return false;
+      }
+      return true;
+    });
     const sf = STATE.ui.sort.field;
     const sd = STATE.ui.sort.direction;
     out.sort((a, b) => {
@@ -887,7 +918,11 @@
     return STATE.filtered.slice(start, start + STATE.ui.pageSize);
   }
   function types() {
-    return [...new Set(STATE.all.map((x) => x.type || "Unknown"))].sort((a, b) => a.localeCompare(b, "pl"));
+    if (STATE.cache.typesDataVersion === STATE.dataVersion) return STATE.cache.typesValues;
+    const next = [...new Set(STATE.all.map((x) => x.type || "Unknown"))].sort((a, b) => a.localeCompare(b, "pl"));
+    STATE.cache.typesDataVersion = STATE.dataVersion;
+    STATE.cache.typesValues = next;
+    return next;
   }
   function pagesWindow() {
     const max = 7;
@@ -930,6 +965,7 @@
       STATE.payloadMeta.listSource = extracted.source || "none";
       STATE.payloadMeta.listCount = Array.isArray(extracted.list) ? extracted.list.length : 0;
       STATE.all = (extracted.list || []).map(normalizeTask);
+      markAllDataChanged();
       STATE.page = 1;
       STATE.fetchedAt = new Date();
       applyQuery();
@@ -1154,12 +1190,13 @@
     if (!isCalendarDateField(field)) return;
     setCalendarAnchorFromElement(anchorEl);
     const sameField = STATE.calendar.open && STATE.calendar.targetField === field;
-    if (!sameField) setCalendarMonthFromIso(calendarFieldIsoValue(field));
+    if (sameField) return;
+    setCalendarMonthFromIso(calendarFieldIsoValue(field));
     STATE.calendar.targetField = field;
     STATE.calendar.open = true;
     STATE.calendar.error = "";
     STATE.calendar.suppressBlurCommit = false;
-    render();
+    scheduleRender();
   }
   function applyDateFieldIso(field, isoValue) {
     if (!isCalendarDateField(field)) return;
@@ -1183,7 +1220,7 @@
     const parsed = parseDmyToIso(txt);
     if (!parsed) {
       STATE.calendar.error = "Niepoprawny format daty. Uzyj DD-MM-RRRR.";
-      render();
+      scheduleRender();
       return;
     }
     STATE.calendar.error = "";
@@ -1207,7 +1244,7 @@
       STATE.calendar.month = 11;
       STATE.calendar.year -= 1;
     }
-    render();
+    scheduleRender();
   }
   function onCalendarNextMonth() {
     STATE.calendar.month += 1;
@@ -1215,7 +1252,7 @@
       STATE.calendar.month = 0;
       STATE.calendar.year += 1;
     }
-    render();
+    scheduleRender();
   }
   function onCalendarToday() {
     const now = new Date();
@@ -1223,7 +1260,7 @@
     STATE.calendar.month = now.getMonth();
     STATE.calendar.error = "";
     STATE.calendar.suppressBlurCommit = false;
-    render();
+    scheduleRender();
   }
   function onCalendarClear() {
     const targetField = STATE.calendar.targetField;
@@ -1260,7 +1297,7 @@
     STATE.page = 1;
     applyQuery();
     saveUi();
-    render();
+    scheduleRender();
   }
   function setFilterMulti(key, select) {
     const arr = [...select.options].filter((o) => o.selected).map((o) => o.value);
@@ -1269,7 +1306,7 @@
   function toggleSort(field) {
     if (STATE.ui.sort.field === field) STATE.ui.sort.direction = STATE.ui.sort.direction === "asc" ? "desc" : "asc";
     else { STATE.ui.sort.field = field; STATE.ui.sort.direction = "asc"; }
-    applyQuery(); saveUi(); render();
+    applyQuery(); saveUi(); scheduleRender();
   }
   function resetFilters() {
     const d = defaults();
@@ -1279,7 +1316,7 @@
     STATE.page = 1;
     applyQuery();
     saveUi();
-    render();
+    scheduleRender();
   }
   function findTaskById(taskId) {
     return STATE.all.find((task) => task.id === taskId) || null;
@@ -1351,7 +1388,7 @@
     STATE.edit.dirty = true;
     STATE.edit.error = "";
     STATE.edit.success = "";
-    render();
+    scheduleRender();
   }
   function applyLocalTaskPatch(taskId, patch) {
     if (!taskId || !patch) return;
@@ -1581,6 +1618,7 @@
       }
 
       STATE.all = STATE.all.filter((x) => x.id !== task.id);
+      markAllDataChanged();
       applyQuery();
       STATE.notice = "Zadanie usuniete.";
       closeEditModal();
@@ -2051,7 +2089,7 @@ ${confirmHtml}`;
         if (target.closest("[data-a='cal-root']")) return;
         if (target.closest("[data-date-input]")) return;
         closeCalendar();
-        render();
+        scheduleRender();
       });
     }
     const close = root.querySelector('[data-a="close"]');
@@ -2154,7 +2192,7 @@ ${confirmHtml}`;
         }
         if (e.key === "Escape") {
           closeCalendar();
-          render();
+          scheduleRender();
         }
       });
       el.addEventListener("blur", (e) => {
@@ -2194,7 +2232,7 @@ ${confirmHtml}`;
       STATE.page = 1;
       applyQuery();
       saveUi();
-      render();
+      scheduleRender();
     });
     root.querySelectorAll("[data-a]").forEach((el) => {
       const a = el.getAttribute("data-a");
@@ -2205,11 +2243,11 @@ ${confirmHtml}`;
           if (id) openEditModal(id);
         });
       }
-      if (a === "first") el.addEventListener("click", () => { STATE.page = 1; render(); });
-      if (a === "prev") el.addEventListener("click", () => { STATE.page = Math.max(1, STATE.page - 1); render(); });
-      if (a === "next") el.addEventListener("click", () => { STATE.page = Math.min(STATE.pages, STATE.page + 1); render(); });
-      if (a === "last") el.addEventListener("click", () => { STATE.page = STATE.pages; render(); });
-      if (a === "page") el.addEventListener("click", (e) => { STATE.page = Number(e.currentTarget.getAttribute("data-page")) || 1; render(); });
+      if (a === "first") el.addEventListener("click", () => { STATE.page = 1; scheduleRender(); });
+      if (a === "prev") el.addEventListener("click", () => { STATE.page = Math.max(1, STATE.page - 1); scheduleRender(); });
+      if (a === "next") el.addEventListener("click", () => { STATE.page = Math.min(STATE.pages, STATE.page + 1); scheduleRender(); });
+      if (a === "last") el.addEventListener("click", () => { STATE.page = STATE.pages; scheduleRender(); });
+      if (a === "page") el.addEventListener("click", (e) => { STATE.page = Number(e.currentTarget.getAttribute("data-page")) || 1; scheduleRender(); });
     });
   }
   function captureFocusState(root) {
@@ -2275,10 +2313,10 @@ ${confirmHtml}`;
   }
 
   function render() {
+    STATE.renderQueued = false;
     const root = ensureShadowRoot();
     if (!STATE.open) { root.innerHTML = ""; return; }
     const focusState = captureFocusState(root);
-    ensureShadowStyle(root);
     root.innerHTML = html(false);
     ensureShadowStyle(root);
     collectRenderDebug(root);
