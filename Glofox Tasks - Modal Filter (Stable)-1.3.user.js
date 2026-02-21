@@ -2077,6 +2077,14 @@ ${confirmHtml}`;
     if (refresh) refresh.addEventListener("click", () => fetchTasks(true));
   }
 
+  function getActionTarget(root, event) {
+    const target = event.target instanceof HTMLElement ? event.target : null;
+    if (!target) return null;
+    const actionEl = target.closest("[data-a]");
+    if (!actionEl) return null;
+    return root.contains(actionEl) ? actionEl : null;
+  }
+
   function bind(root) {
     const overlay = root.querySelector('[data-role="overlay"]');
     if (overlay) overlay.addEventListener("click", (e) => { if (e.target === overlay) closeModal(); });
@@ -2092,93 +2100,133 @@ ${confirmHtml}`;
         scheduleRender();
       });
     }
-    const close = root.querySelector('[data-a="close"]');
-    if (close) close.addEventListener("click", closeModal);
-    const refresh = root.querySelector('[data-a="refresh"]');
-    if (refresh) refresh.addEventListener("click", () => fetchTasks(true));
-    const reset = root.querySelector('[data-a="reset"]');
-    if (reset) reset.addEventListener("click", resetFilters);
-    const editOverlay = root.querySelector('[data-a="edit-overlay"]');
-    if (editOverlay) {
-      editOverlay.addEventListener("click", (e) => {
-        if (e.target === editOverlay && !STATE.edit.saving && !STATE.edit.deleting) closeEditModal();
-      });
-    }
-    const deleteOverlay = root.querySelector('[data-a="delete-overlay"]');
-    if (deleteOverlay) {
-      deleteOverlay.addEventListener("click", (e) => {
-        if (e.target === deleteOverlay && !STATE.edit.deleting) closeDeleteConfirm();
-      });
-    }
-    const editCancel = root.querySelector('[data-a="edit-cancel"]');
-    if (editCancel) editCancel.addEventListener("click", () => {
-      if (STATE.edit.saving || STATE.edit.deleting) return;
-      closeEditModal();
-    });
-    const editDelete = root.querySelector('[data-a="edit-delete"]');
-    if (editDelete) editDelete.addEventListener("click", openDeleteConfirm);
-    const editSave = root.querySelector('[data-a="edit-save"]');
-    if (editSave) editSave.addEventListener("click", saveTaskEdit);
-    const deleteCancel = root.querySelector('[data-a="delete-cancel"]');
-    if (deleteCancel) deleteCancel.addEventListener("click", closeDeleteConfirm);
-    const deleteConfirm = root.querySelector('[data-a="delete-confirm"]');
-    if (deleteConfirm) deleteConfirm.addEventListener("click", confirmDeleteTask);
-    const calPrev = root.querySelector('[data-a="cal-prev"]');
-    if (calPrev) {
-      calPrev.addEventListener("mousedown", () => {
+    root.addEventListener("mousedown", (e) => {
+      const actionEl = getActionTarget(root, e);
+      if (!actionEl) return;
+      const action = actionEl.getAttribute("data-a");
+      if (action === "cal-prev" || action === "cal-next" || action === "cal-today" || action === "cal-clear" || action === "cal-day") {
         STATE.calendar.suppressBlurCommit = true;
-      });
-      calPrev.addEventListener("click", () => {
+      }
+    });
+    root.addEventListener("click", (e) => {
+      const actionEl = getActionTarget(root, e);
+      if (!actionEl) return;
+      const action = actionEl.getAttribute("data-a");
+      if (!action) return;
+
+      if (action === "edit-overlay") {
+        if (e.target === actionEl && !STATE.edit.saving && !STATE.edit.deleting) closeEditModal();
+        return;
+      }
+      if (action === "delete-overlay") {
+        if (e.target === actionEl && !STATE.edit.deleting) closeDeleteConfirm();
+        return;
+      }
+
+      if (action === "close") {
+        closeModal();
+        return;
+      }
+      if (action === "refresh") {
+        fetchTasks(true);
+        return;
+      }
+      if (action === "reset") {
+        resetFilters();
+        return;
+      }
+      if (action === "sort") {
+        toggleSort(actionEl.getAttribute("data-sort"));
+        return;
+      }
+      if (action === "open-edit") {
+        const id = actionEl.getAttribute("data-task-id");
+        if (id) openEditModal(id);
+        return;
+      }
+      if (action === "edit-cancel") {
+        if (STATE.edit.saving || STATE.edit.deleting) return;
+        closeEditModal();
+        return;
+      }
+      if (action === "edit-delete") {
+        openDeleteConfirm();
+        return;
+      }
+      if (action === "edit-save") {
+        saveTaskEdit();
+        return;
+      }
+      if (action === "delete-cancel") {
+        closeDeleteConfirm();
+        return;
+      }
+      if (action === "delete-confirm") {
+        confirmDeleteTask();
+        return;
+      }
+      if (action === "cal-prev") {
         onCalendarPrevMonth();
         STATE.calendar.suppressBlurCommit = false;
-      });
-    }
-    const calNext = root.querySelector('[data-a="cal-next"]');
-    if (calNext) {
-      calNext.addEventListener("mousedown", () => {
-        STATE.calendar.suppressBlurCommit = true;
-      });
-      calNext.addEventListener("click", () => {
+        return;
+      }
+      if (action === "cal-next") {
         onCalendarNextMonth();
         STATE.calendar.suppressBlurCommit = false;
-      });
-    }
-    const calToday = root.querySelector('[data-a="cal-today"]');
-    if (calToday) {
-      calToday.addEventListener("mousedown", () => {
-        STATE.calendar.suppressBlurCommit = true;
-      });
-      calToday.addEventListener("click", () => {
+        return;
+      }
+      if (action === "cal-today") {
         onCalendarToday();
         STATE.calendar.suppressBlurCommit = false;
-      });
-    }
-    const calClear = root.querySelector('[data-a="cal-clear"]');
-    if (calClear) {
-      calClear.addEventListener("mousedown", () => {
-        STATE.calendar.suppressBlurCommit = true;
-      });
-      calClear.addEventListener("click", () => {
+        return;
+      }
+      if (action === "cal-clear") {
         onCalendarClear();
         STATE.calendar.suppressBlurCommit = false;
-      });
-    }
-    root.querySelectorAll('[data-a="cal-day"]').forEach((el) => {
-      el.addEventListener("mousedown", () => {
-        STATE.calendar.suppressBlurCommit = true;
-      });
-      el.addEventListener("click", (e) => {
-        const day = Number(e.currentTarget.getAttribute("data-day"));
-        if (!Number.isFinite(day) || day < 1) {
-          STATE.calendar.suppressBlurCommit = false;
-          return;
-        }
-        onCalendarSelectDay(day);
+        return;
+      }
+      if (action === "cal-day") {
+        const day = Number(actionEl.getAttribute("data-day"));
+        if (Number.isFinite(day) && day > 0) onCalendarSelectDay(day);
         STATE.calendar.suppressBlurCommit = false;
-      });
+        return;
+      }
+      if (action === "first") {
+        if (STATE.page === 1) return;
+        STATE.page = 1;
+        scheduleRender();
+        return;
+      }
+      if (action === "prev") {
+        const nextPage = Math.max(1, STATE.page - 1);
+        if (nextPage === STATE.page) return;
+        STATE.page = nextPage;
+        scheduleRender();
+        return;
+      }
+      if (action === "next") {
+        const nextPage = Math.min(STATE.pages, STATE.page + 1);
+        if (nextPage === STATE.page) return;
+        STATE.page = nextPage;
+        scheduleRender();
+        return;
+      }
+      if (action === "last") {
+        if (STATE.page === STATE.pages) return;
+        STATE.page = STATE.pages;
+        scheduleRender();
+        return;
+      }
+      if (action === "page") {
+        const targetPage = Number(actionEl.getAttribute("data-page")) || 1;
+        if (targetPage === STATE.page) return;
+        STATE.page = targetPage;
+        scheduleRender();
+      }
     });
 
-    root.querySelectorAll("[data-date-input]").forEach((el) => {
+    const dateInputs = root.querySelectorAll("[data-date-input]");
+    dateInputs.forEach((el) => {
       const field = el.getAttribute("data-date-input");
       if (!field || !isCalendarDateField(field)) return;
       el.addEventListener("focus", (e) => openCalendarForField(field, e.currentTarget));
@@ -2203,7 +2251,8 @@ ${confirmHtml}`;
         commitDateFieldText(field, e.target.value);
       });
     });
-    root.querySelectorAll("[data-edit-field]").forEach((el) => {
+    const editFields = root.querySelectorAll("[data-edit-field]");
+    editFields.forEach((el) => {
       const field = el.getAttribute("data-edit-field");
       if (!field) return;
       if (field === "markDone") {
@@ -2215,7 +2264,8 @@ ${confirmHtml}`;
       }
     });
 
-    root.querySelectorAll("[data-f]").forEach((el) => {
+    const filterFields = root.querySelectorAll("[data-f]");
+    filterFields.forEach((el) => {
       const key = el.getAttribute("data-f");
       if (!key) return;
       if (isDateFilterKey(key)) return;
@@ -2233,21 +2283,6 @@ ${confirmHtml}`;
       applyQuery();
       saveUi();
       scheduleRender();
-    });
-    root.querySelectorAll("[data-a]").forEach((el) => {
-      const a = el.getAttribute("data-a");
-      if (a === "sort") el.addEventListener("click", (e) => toggleSort(e.currentTarget.getAttribute("data-sort")));
-      if (a === "open-edit") {
-        el.addEventListener("click", (e) => {
-          const id = e.currentTarget.getAttribute("data-task-id");
-          if (id) openEditModal(id);
-        });
-      }
-      if (a === "first") el.addEventListener("click", () => { STATE.page = 1; scheduleRender(); });
-      if (a === "prev") el.addEventListener("click", () => { STATE.page = Math.max(1, STATE.page - 1); scheduleRender(); });
-      if (a === "next") el.addEventListener("click", () => { STATE.page = Math.min(STATE.pages, STATE.page + 1); scheduleRender(); });
-      if (a === "last") el.addEventListener("click", () => { STATE.page = STATE.pages; scheduleRender(); });
-      if (a === "page") el.addEventListener("click", (e) => { STATE.page = Number(e.currentTarget.getAttribute("data-page")) || 1; scheduleRender(); });
     });
   }
   function captureFocusState(root) {
